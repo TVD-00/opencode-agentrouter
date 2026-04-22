@@ -1,0 +1,41 @@
+{
+  "name": "opencode-agentrouter",
+  "version": "1.0.0",
+  "description": "OpenCode plugin to use models from agentrouter.org",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "agentrouter",
+    "llm",
+    "ai",
+    "claude",
+    "deepseek",
+    "glm"
+  ],
+  "author": "github-47303",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/github-47303/opencode-agentrouter.git"
+  },
+  "homepage": "https://github.com/github-47303/opencode-agentrouter#readme",
+  "bugs": {
+    "url": "https://github.com/github-47303/opencode-agentrouter/issues"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.4.10",
+    "@types/node": "^25.6.0",
+    "typescript": "^5.7.0"
+  }
+}
