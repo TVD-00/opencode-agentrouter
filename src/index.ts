@@ -1,47 +1,12 @@
-/**
- * opencode-agentrouter
- *
- * OpenCode plugin that enables AgentRouter (agentrouter.org) models
- * by injecting the required client identity headers into every request.
- *
- * AgentRouter's OneAPI gateway validates incoming requests against a
- * whitelist of known coding-agent clients. Requests that lack the
- * expected headers are rejected with "unauthorized client detected".
- *
- * This plugin patches `globalThis.fetch` at module-load time so that
- * any request targeting agentrouter.org automatically carries the
- * same headers that RooCode sends via the `openai` npm package.
- *
- * Additionally, for Claude models proxied through AgentRouter, the
- * plugin strips the `reasoning_effort` field from request bodies.
- * AgentRouter rejects this field with:
- *   "***.***.enabled" is not supported for this model.
- *    Use "***.***.adaptive" and "output_config.effort"
- *
- * Headers were captured from a verified, working RooCode session:
- *   - RooCode identity: HTTP-Referer, X-Title, User-Agent
- *   - OpenAI SDK fingerprint: x-stainless-* family
- *
- * @see https://github.com/RooCodeInc/Roo-Code/blob/main/src/api/providers/constants.ts
- * @see https://docs.agentrouter.org
- */
-
 import type { Plugin } from "@opencode-ai/plugin"
+import { join } from "node:path"
 
-/** Only intercept requests to this host. */
 const AGENTROUTER_HOST = "agentrouter.org"
 
-/**
- * Headers that AgentRouter expects on every API call.
- * Captured from a successful RooCode + openai@6.34.0 session.
- */
 const REQUIRED_HEADERS: Record<string, string> = {
-  // RooCode client identity
   "http-referer": "https://github.com/RooVetGit/Roo-Cline",
   "x-title": "Roo Code",
   "user-agent": "RooCode/3.52.1",
-
-  // OpenAI SDK stainless telemetry (required by AgentRouter gateway)
   "x-stainless-arch": "x64",
   "x-stainless-lang": "js",
   "x-stainless-os": "Windows",
@@ -50,15 +15,14 @@ const REQUIRED_HEADERS: Record<string, string> = {
   "x-stainless-runtime-version": "v22.12.0",
 }
 
-/**
- * Models that need `reasoning_effort` stripped from request body.
- * AgentRouter rejects this field for Claude models with HTTP 400.
- */
-const STRIP_REASONING_MODELS = ["claude-opus", "claude-sonnet", "claude-haiku"]
+const CLAUDE_PREFIX = "claude"
+const FIELDS_TO_STRIP = ["reasoning_effort", "reasoning"]
+const MAX_ATTEMPTS = 30
+const RETRY_DELAYS_MS = [1000, 1000, 2000, 2000, 3000, 3000, 5000]
 
-/**
- * Safely extract a URL from any fetch input.
- */
+let claudeCooldownUntil = 0
+let claudeQueue: Promise<void> = Promise.resolve()
+
 function getURL(input: RequestInfo | URL): URL | null {
   try {
     if (typeof input === "string") return new URL(input)
@@ -70,31 +34,114 @@ function getURL(input: RequestInfo | URL): URL | null {
   }
 }
 
-/**
- * Check if request body contains a Claude model and strip
- * incompatible fields (reasoning_effort) if so.
- * Returns the original or modified body.
- */
-function sanitizeBody(body: BodyInit | null | undefined): BodyInit | null | undefined {
-  if (!body || typeof body !== "string") return body
-
-  try {
-    const json = JSON.parse(body)
-    const model: string = json.model || ""
-    const needsStrip = STRIP_REASONING_MODELS.some((prefix) => model.includes(prefix))
-
-    if (needsStrip) {
-      delete json.reasoning_effort
-      return JSON.stringify(json)
+async function readBodySafe(
+  body: unknown,
+): Promise<{ text: string; fallback: BodyInit | null }> {
+  if (!body) return { text: "", fallback: null }
+  if (typeof body === "string") return { text: body, fallback: null }
+  if (body instanceof ArrayBuffer)
+    return { text: new TextDecoder().decode(body), fallback: null }
+  if (body instanceof Uint8Array)
+    return { text: new TextDecoder().decode(body), fallback: null }
+  if (typeof ReadableStream !== "undefined" && body instanceof ReadableStream) {
+    const [forRead, forFallback] = (body as ReadableStream<Uint8Array>).tee()
+    const reader = forRead.getReader()
+    const chunks: Uint8Array[] = []
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value) chunks.push(value)
     }
+    const total = chunks.reduce((acc, c) => acc + c.length, 0)
+    const merged = new Uint8Array(total)
+    let offset = 0
+    for (const c of chunks) {
+      merged.set(c, offset)
+      offset += c.length
+    }
+    return { text: new TextDecoder().decode(merged), fallback: forFallback }
+  }
+  return { text: String(body), fallback: null }
+}
 
-    return body
+function isClaudeModel(model: unknown): model is string {
+  return typeof model === "string" && model.startsWith(CLAUDE_PREFIX)
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function nextDelayMs(attempt: number): number {
+  return RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)]
+}
+
+async function readErrorPayload(
+  resp: Response,
+): Promise<{ code?: string; message?: string }> {
+  try {
+    const text = await resp.clone().text()
+    const json = JSON.parse(text)
+    return { code: json?.error?.code, message: json?.error?.message }
   } catch {
-    return body
+    return {}
   }
 }
 
-// --- Patch globalThis.fetch at module load time ---
+async function withClaudeQueue<T>(run: () => Promise<T>): Promise<T> {
+  const previous = claudeQueue
+  let release!: () => void
+  claudeQueue = new Promise<void>((resolve) => {
+    release = resolve
+  })
+
+  await previous
+  try {
+    const now = Date.now()
+    if (claudeCooldownUntil > now) {
+      await sleep(claudeCooldownUntil - now)
+    }
+    return await run()
+  } finally {
+    release()
+  }
+}
+
+function sanitizeBody(bodyStr: string): {
+  finalBody: string
+  modelName: string
+} {
+  let modelName = ""
+  try {
+    const json = JSON.parse(bodyStr)
+    modelName = typeof json.model === "string" ? json.model : ""
+
+    if (isClaudeModel(json.model)) {
+      for (const field of FIELDS_TO_STRIP) {
+        delete json[field]
+      }
+      if (Array.isArray(json.messages)) {
+        for (const msg of json.messages) {
+          if (msg && typeof msg === "object") {
+            delete (msg as Record<string, unknown>).cache_control
+            const content = (msg as Record<string, unknown>)?.content
+            if (Array.isArray(content)) {
+              for (const block of content) {
+                if (block && typeof block === "object") {
+                  delete (block as Record<string, unknown>).cache_control
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return { finalBody: JSON.stringify(json), modelName }
+  } catch {
+    return { finalBody: bodyStr, modelName }
+  }
+}
 
 const originalFetch = globalThis.fetch
 
@@ -104,54 +151,66 @@ globalThis.fetch = async function patchedFetch(
 ): Promise<Response> {
   const url = getURL(input)
 
-  // Pass through anything that is not targeting AgentRouter
   if (!url || !url.hostname.endsWith(AGENTROUTER_HOST)) {
     return originalFetch(input, init)
   }
 
-  // Build headers from the original request, then overwrite with required set
   const headers = new Headers(
     init?.headers ?? (input instanceof Request ? input.headers : undefined),
   )
-
   for (const [key, value] of Object.entries(REQUIRED_HEADERS)) {
     headers.set(key, value)
   }
 
-  if (!headers.has("x-stainless-retry-count")) {
-    headers.set("x-stainless-retry-count", "0")
-  }
+  const rawBody =
+    init?.body ?? (input instanceof Request ? input.body : undefined)
+  const { text: bodyStr, fallback } = await readBodySafe(rawBody)
+  const { finalBody, modelName } = sanitizeBody(bodyStr)
 
-  // Sanitize body: strip incompatible fields for Claude models
-  const originalBody = init?.body ?? (input instanceof Request ? input.body : undefined)
-  const sanitizedBody = sanitizeBody(originalBody as BodyInit | null | undefined)
+  const bodyToSend = finalBody !== bodyStr ? finalBody : (fallback ?? bodyStr)
 
-  const patchedInit: RequestInit = { ...init, headers, body: sanitizedBody }
-
-  // Rebuild Request object when the input is a Request instance
-  if (input instanceof Request) {
-    const rebuilt = new Request(input.url, {
-      method: input.method,
-      redirect: input.redirect,
-      signal: init?.signal ?? input.signal,
-      ...patchedInit,
+  const sendRequest = () =>
+    originalFetch(url.href, {
+      method:
+        init?.method ?? (input instanceof Request ? input.method : "POST"),
+      headers,
+      body: bodyToSend,
+      signal:
+        init?.signal ?? (input instanceof Request ? input.signal : undefined),
     })
-    return originalFetch(rebuilt)
+
+  const runWithRetry = async (): Promise<Response> => {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const resp = await sendRequest()
+
+      if (resp.ok) {
+        if (isClaudeModel(modelName)) claudeCooldownUntil = 0
+        return resp
+      }
+
+      const errorPayload = await readErrorPayload(resp)
+      const shouldRetry =
+        errorPayload.code === "sensitive_words_detected" ||
+        errorPayload.message?.includes("sensitive words detected")
+
+      if (!shouldRetry || attempt === MAX_ATTEMPTS) {
+        return resp
+      }
+
+      const delayMs = nextDelayMs(attempt)
+      if (isClaudeModel(modelName)) claudeCooldownUntil = Date.now() + delayMs
+      await sleep(delayMs)
+    }
+
+    return sendRequest()
   }
 
-  return originalFetch(input, patchedInit)
+  if (isClaudeModel(modelName)) {
+    return withClaudeQueue(runWithRetry)
+  }
+  return runWithRetry()
 }
 
-// --- Plugin export ---
-
-export const AgentRouterAuth: Plugin = async ({ client }) => {
-  await client.app.log({
-    body: {
-      service: "opencode-agentrouter",
-      level: "info",
-      message: "AgentRouter plugin loaded — client identity headers active, Claude body sanitizer active",
-    },
-  })
-
+export const AgentRouterAuth: Plugin = async () => {
   return {}
 }
