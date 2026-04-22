@@ -12,6 +12,12 @@
  * any request targeting agentrouter.org automatically carries the
  * same headers that RooCode sends via the `openai` npm package.
  *
+ * Additionally, for Claude models proxied through AgentRouter, the
+ * plugin strips the `reasoning_effort` field from request bodies.
+ * AgentRouter rejects this field with:
+ *   "***.***.enabled" is not supported for this model.
+ *    Use "***.***.adaptive" and "output_config.effort"
+ *
  * Headers were captured from a verified, working RooCode session:
  *   - RooCode identity: HTTP-Referer, X-Title, User-Agent
  *   - OpenAI SDK fingerprint: x-stainless-* family
@@ -45,8 +51,13 @@ const REQUIRED_HEADERS: Record<string, string> = {
 }
 
 /**
+ * Models that need `reasoning_effort` stripped from request body.
+ * AgentRouter rejects this field for Claude models with HTTP 400.
+ */
+const STRIP_REASONING_MODELS = ["claude-opus", "claude-sonnet", "claude-haiku"]
+
+/**
  * Safely extract a URL from any fetch input.
- * Returns null if the input cannot be parsed.
  */
 function getURL(input: RequestInfo | URL): URL | null {
   try {
@@ -56,6 +67,30 @@ function getURL(input: RequestInfo | URL): URL | null {
     return new URL(String(input))
   } catch {
     return null
+  }
+}
+
+/**
+ * Check if request body contains a Claude model and strip
+ * incompatible fields (reasoning_effort) if so.
+ * Returns the original or modified body.
+ */
+function sanitizeBody(body: BodyInit | null | undefined): BodyInit | null | undefined {
+  if (!body || typeof body !== "string") return body
+
+  try {
+    const json = JSON.parse(body)
+    const model: string = json.model || ""
+    const needsStrip = STRIP_REASONING_MODELS.some((prefix) => model.includes(prefix))
+
+    if (needsStrip) {
+      delete json.reasoning_effort
+      return JSON.stringify(json)
+    }
+
+    return body
+  } catch {
+    return body
   }
 }
 
@@ -87,13 +122,16 @@ globalThis.fetch = async function patchedFetch(
     headers.set("x-stainless-retry-count", "0")
   }
 
-  const patchedInit: RequestInit = { ...init, headers }
+  // Sanitize body: strip incompatible fields for Claude models
+  const originalBody = init?.body ?? (input instanceof Request ? input.body : undefined)
+  const sanitizedBody = sanitizeBody(originalBody as BodyInit | null | undefined)
+
+  const patchedInit: RequestInit = { ...init, headers, body: sanitizedBody }
 
   // Rebuild Request object when the input is a Request instance
   if (input instanceof Request) {
     const rebuilt = new Request(input.url, {
       method: input.method,
-      body: input.body,
       redirect: input.redirect,
       signal: init?.signal ?? input.signal,
       ...patchedInit,
@@ -111,7 +149,7 @@ export const AgentRouterAuth: Plugin = async ({ client }) => {
     body: {
       service: "opencode-agentrouter",
       level: "info",
-      message: "AgentRouter plugin loaded — client identity headers active",
+      message: "AgentRouter plugin loaded — client identity headers active, Claude body sanitizer active",
     },
   })
 

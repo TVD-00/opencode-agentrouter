@@ -1,6 +1,6 @@
 {
   "name": "opencode-agentrouter",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "OpenCode plugin to use models from agentrouter.org",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -27,11 +27,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/github-47303/opencode-agentrouter.git"
+    "url": "git+https://github.com/TVD-00/opencode-agentrouter.git"
   },
-  "homepage": "https://github.com/github-47303/opencode-agentrouter#readme",
+  "homepage": "https://github.com/TVD-00/opencode-agentrouter#readme",
   "bugs": {
-    "url": "https://github.com/github-47303/opencode-agentrouter/issues"
+    "url": "https://github.com/TVD-00/opencode-agentrouter/issues"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.4.10",
