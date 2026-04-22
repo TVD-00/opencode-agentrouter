@@ -1,6 +1,6 @@
 {
   "name": "opencode-agentrouter",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "OpenCode plugin to use models from agentrouter.org",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
