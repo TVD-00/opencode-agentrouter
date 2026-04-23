@@ -1,5 +1,4 @@
 import type { Plugin } from "@opencode-ai/plugin"
-import { join } from "node:path"
 
 const AGENTROUTER_HOST = "agentrouter.org"
 
@@ -16,6 +15,7 @@ const REQUIRED_HEADERS: Record<string, string> = {
 }
 
 const CLAUDE_PREFIX = "claude"
+const CLAUDE_OPUS_4_7 = "claude-opus-4-7"
 const FIELDS_TO_STRIP = ["reasoning_effort", "reasoning"]
 const MAX_ATTEMPTS = 30
 const RETRY_DELAYS_MS = [1000, 1000, 2000, 2000, 3000, 3000, 5000]
@@ -120,6 +120,22 @@ function sanitizeBody(bodyStr: string): {
       for (const field of FIELDS_TO_STRIP) {
         delete json[field]
       }
+
+      const isOpus47 = typeof json.model === "string" && json.model.includes(CLAUDE_OPUS_4_7)
+      if (isOpus47) {
+        json.thinking = { type: "adaptive" }
+      } else {
+        const existingThinking = json.thinking
+        if (!existingThinking || typeof existingThinking !== "object") {
+          json.thinking = { type: "adaptive" }
+        } else if ((existingThinking as Record<string, unknown>).type === "enabled") {
+          json.thinking = { type: "adaptive" }
+          if (typeof (existingThinking as Record<string, unknown>).budget_tokens === "number") {
+            delete (existingThinking as Record<string, unknown>).budget_tokens
+          }
+        }
+      }
+
       if (Array.isArray(json.messages)) {
         for (const msg of json.messages) {
           if (msg && typeof msg === "object") {

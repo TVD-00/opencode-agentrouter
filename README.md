@@ -1,18 +1,22 @@
 # opencode-agentrouter
 
-OpenCode plugin that lets you use [AgentRouter](https://agentrouter.org) models inside [OpenCode](https://opencode.ai).
-
-AgentRouter provides access to Claude Opus, DeepSeek, GLM and other models through a unified API. This plugin handles the authentication handshake so OpenCode can connect without being blocked.
+OpenCode plugin for using [AgentRouter](https://agentrouter.org) models inside [OpenCode](https://opencode.ai).
 
 ## How it works
 
-AgentRouter validates incoming requests against a whitelist of known coding-agent clients. Raw API calls are rejected with `"unauthorized client detected"`. This plugin patches `globalThis.fetch` to inject the required client identity headers into every request targeting `agentrouter.org` — making OpenCode appear as an authorized client.
+The plugin patches `globalThis.fetch` at module load time. For any request to `agentrouter.org` it:
+
+1. **Injects identity headers** — AgentRouter only allows requests from whitelisted coding-agent clients. The plugin adds the required headers so OpenCode is accepted.
+2. **Sanitizes Claude request bodies** — Strips `reasoning_effort`, `reasoning`, and `cache_control` fields that AgentRouter rejects.
+3. **Injects adaptive thinking** — Automatically sets `thinking: { type: "adaptive" }` for Claude models. Opus 4.7 requires adaptive thinking; older Claude models are upgraded from `type: "enabled"` (deprecated) to `type: "adaptive"`.
+4. **Auto-retries on sensitive content errors** — When AgentRouter returns `sensitive_words_detected`, the plugin retries with exponential backoff (up to 30 attempts).
+5. **Serializes Claude requests** — Queues Claude model calls with cooldown to avoid rate limiting.
+
+Requests to all other domains pass through untouched.
 
 ## Install
 
 ### Option A: npm plugin (recommended)
-
-Add to your OpenCode config (`~/.config/opencode/opencode.json` or `opencode.json`):
 
 ```json
 {
@@ -20,25 +24,24 @@ Add to your OpenCode config (`~/.config/opencode/opencode.json` or `opencode.jso
 }
 ```
 
-OpenCode installs npm plugins automatically at startup.
+Add to your OpenCode config (`~/.config/opencode/opencode.json`). OpenCode installs npm plugins automatically.
 
 ### Option B: local plugin
 
-Copy `dist/index.js` into your plugins directory:
+Copy `dist/index.js` to:
 
 ```
 ~/.config/opencode/plugins/agentrouter-auth.js
 ```
 
-Files in the plugins directory are auto-loaded — no config needed.
+Files in the plugins directory are auto-loaded.
 
 ## Configure provider
-
-Add the AgentRouter provider to your OpenCode config:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-agentrouter"],
   "provider": {
     "agentrouter": {
       "npm": "@ai-sdk/openai-compatible",
@@ -48,19 +51,24 @@ Add the AgentRouter provider to your OpenCode config:
         "apiKey": "sk-YOUR-KEY-HERE"
       },
       "models": {
+        "claude-opus-4-6": {
+          "name": "Claude Opus 4.6",
+          "limit": { "context": 1000000, "output": 128000 },
+          "reasoning": true
+        },
         "claude-opus-4-7": {
           "name": "Claude Opus 4.7",
           "limit": { "context": 1000000, "output": 128000 },
           "reasoning": true
         },
-        "glm-5.1": {
-          "name": "GLM 5.1",
-          "limit": { "context": 202752, "output": 65535 },
-          "reasoning": true
-        },
         "deepseek-r1-0528": {
           "name": "DeepSeek R1 0528",
           "limit": { "context": 163840, "output": 16384 },
+          "reasoning": true
+        },
+        "glm-5.1": {
+          "name": "GLM 5.1",
+          "limit": { "context": 202752, "output": 65535 },
           "reasoning": true
         }
       }
@@ -93,16 +101,10 @@ Check https://agentrouter.org/pricing for the latest list.
 3. Restart OpenCode
 4. Run `/models` and select an AgentRouter model
 
-## How the plugin works
-
-The plugin runs at module load time and patches `globalThis.fetch`. For any request to `agentrouter.org`, it injects headers that identify the caller as an authorized coding-agent client. Requests to all other domains pass through untouched.
-
-No API keys are stored or transmitted by the plugin itself — it only adds identity headers. Your API key is managed by OpenCode's provider config as usual.
-
 ## Development
 
 ```bash
-git clone https://github.com/github-47303/opencode-agentrouter.git
+git clone https://github.com/TVD-00/opencode-agentrouter.git
 cd opencode-agentrouter
 npm install
 npm run build
